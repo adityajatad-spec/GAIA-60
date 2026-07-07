@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "gaia-agent"
+version = "0.1.0"
+description = "A CLI research agent that answers complex, multi-step questions using tool use (web search, web browsing, code execution, file parsing)"
+authors = ["Your Name <you@example.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+anthropic = "^0.10.0"
+openai = "^1.0.0"
+python-dotenv = "^1.0.0"
+requests = "^2.31.0"
+pypdf = "^3.10.0"
+python-docx = "^0.8.11"
+openpyxl = "^3.0.10"
+pillow = "^10.0.0"
+tavily-python = "^0.2.0"
+trafilatura = "^2.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.3.0"
+
+[build-system]
+requires = ["poetry-core>=1.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+gaia-agent = "agent.__main__:main"

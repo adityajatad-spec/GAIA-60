@@ -1,0 +1,10 @@
+{"task_id": "challenge_001", "Question": "How many moons does Mars have?", "Level": 1, "Final answer": "2"}
+{"task_id": "challenge_002", "Question": "What is the chemical symbol for the element with atomic number 79?", "Level": 1, "Final answer": "Au"}
+{"task_id": "challenge_003", "Question": "In what year did V-E Day (Victory in Europe Day) occur, marking the end of World War II in Europe? Add 25 to that year.", "Level": 1, "Final answer": "1970"}
+{"task_id": "challenge_004", "Question": "What is the sum of the atomic numbers of Gold and Silver on the periodic table?", "Level": 2, "Final answer": "126"}
+{"task_id": "challenge_005", "Question": "What year was the first iPhone released, and what year was the first commercially available Android phone (HTC Dream / T-Mobile G1) released? What is the sum of both years?", "Level": 2, "Final answer": "4015"}
+{"task_id": "challenge_006", "Question": "What year was the first iPhone released, and what year was the first commercially available Android phone (HTC Dream / T-Mobile G1) released? What is the sum of both years? Is that sum divisible by 3?", "Level": 3, "Final answer": "4015, No"}
+{"task_id": "challenge_007", "Question": "What is the speed of light in a vacuum in kilometers per second, rounded to the nearest whole number? Multiply that number by 60 to find how many kilometers light travels in one minute.", "Level": 2, "Final answer": "17987520"}
+{"task_id": "challenge_008", "Question": "In what year was the Great Fire of London, and in what year was the United States Declaration of Independence adopted? What is the positive difference between these two years?", "Level": 2, "Final answer": "110"}
+{"task_id": "challenge_009", "Question": "How many bones are in the adult human skeleton? What is 206 multiplied by 2?", "Level": 1, "Final answer": "412"}
+{"task_id": "challenge_010", "Question": "What is the freezing point of water in Celsius, and what is the boiling point of water in Celsius? What is the sum of both values?", "Level": 1, "Final answer": "100"}
