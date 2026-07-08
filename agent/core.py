@@ -250,6 +250,7 @@ class ResearchAgent:
         self._format_retried = False
         self._known_urls: set[str] = set()
         self._retried_steps: set[int] = set()
+        self._verified_steps: set[int] = set()
         self._budget_warning_given = False
         self._verify_provider = verify_provider
         self._usage_by_provider: list[tuple[LLMProvider, dict]] = []
@@ -489,8 +490,24 @@ class ResearchAgent:
                 }
 
             # ── Execute tool calls ────────────────────────────────────
+            _verification_retry = False
             for tc in response.tool_calls:
                 output = self._execute_tool(tc.name, tc.input, step)
+
+                # Per-step verification
+                should_retry, nudge = self._verify_tool_result(
+                    tc.name, output, step
+                )
+                if should_retry:
+                    _verification_retry = True
+                    self._verified_steps.add(step)
+                    messages.append({"role": "user", "content": nudge})
+                    if step_callback:
+                        step_callback({
+                            "type": "tool_verification_retry",
+                            "data": {"step": step, "tool": tc.name, "reason": nudge},
+                        })
+                    break
 
                 messages.append(
                     {
@@ -499,6 +516,10 @@ class ResearchAgent:
                         "content": output,
                     }
                 )
+
+            if _verification_retry:
+                messages = self._prune_context(messages, provider, step)
+                continue
 
             # ── Update plan progress ──────────────────────────────────
             if self._plan is not None:
@@ -550,6 +571,72 @@ class ResearchAgent:
             "format_noncompliant": False,
             "usage": self._build_usage(),
         }
+
+    def _verify_tool_result(self, tool_name: str, output: str, step: int) -> tuple[bool, str]:
+        """Lightweight per-step verification using heuristics + fact cross-check.
+
+        Returns ``(should_retry: bool, nudge: str)``.
+        Only triggers once per step (tracked via ``_verified_steps``).
+        """
+        if step in self._verified_steps:
+            return False, ""
+
+        # Empty / no-output
+        if not output.strip() or output == "(no output)":
+            return True, (
+                f"The {tool_name} tool returned empty output. "
+                "Try a different approach or input."
+            )
+
+        # Hard error
+        if output.startswith("ERROR:"):
+            return True, (
+                f"The {tool_name} tool failed. "
+                "Try a different approach."
+            )
+
+        # Search-specific
+        if tool_name == "search" and "No results found." in output:
+            return True, "No search results found. Try different keywords."
+
+        # Code-specific
+        if tool_name == "code_exec":
+            if "ERROR" in output[:200]:
+                return True, "The code had an error. Fix it and rerun."
+            if not any(c.isdigit() for c in output) and len(output) < 10:
+                return True, (
+                    "The code produced no numeric output. "
+                    "Use print() to display results."
+                )
+
+        # Browse-specific
+        if tool_name == "browse":
+            head = output[:300].lower()
+            if "404" in head or "not found" in head or "access denied" in head:
+                return True, (
+                    "Could not access that page. "
+                    "Try searching for the information instead of browsing."
+                )
+
+        # Cross-check against existing structured facts
+        output_lower = output.lower()
+        for fact in self._ctx_manager.facts:
+            if fact.confidence > 0.8:
+                fact_words = fact.fact.lower().split()
+                # If a high-value fact term appears negated in the output
+                for fw in fact_words[:5]:
+                    if len(fw) > 3 and fw in output_lower:
+                        # Check for negation nearby
+                        idx = output_lower.find(fw)
+                        before = output_lower[max(0, idx - 40):idx]
+                        if any(neg in before for neg in ("not ", "n't ", "wrong", "incorrect")):
+                            return True, (
+                                f"This result seems to contradict what we "
+                                f"found earlier ('{fact.fact[:80]}'). "
+                                "Verify both sources."
+                            )
+
+        return False, ""
 
     def _execute_tool(self, name: str, inp: dict, step: int) -> str:
         # ── Browse guard: fuzzy-match URL against prior search results ──

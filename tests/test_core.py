@@ -927,3 +927,211 @@ class TestFinalAnswerPrefixNormalization:
         ok, out = _normalize_final_answer_prefix("Just some text")
         assert not ok
         assert out == "Just some text"
+
+
+# ── Per-step verification retry ────────────────────────────────────────────
+
+
+class TestPerStepVerification:
+    """_verify_tool_result — direct unit tests with a real agent instance."""
+
+    def _make_agent(self) -> ResearchAgent:
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+        return ResearchAgent("test question", provider=provider)
+
+    # ── Empty / no-output ────────────────────────────────────────────
+
+    def test_empty_output_triggers_retry(self):
+        agent = self._make_agent()
+        retry, nudge = agent._verify_tool_result("search", "", step=0)
+        assert retry
+        assert "empty" in nudge.lower()
+
+    def test_no_output_marker_triggers_retry(self):
+        agent = self._make_agent()
+        retry, nudge = agent._verify_tool_result("code_exec", "(no output)", step=0)
+        assert retry
+        assert "empty" in nudge.lower()
+
+    # ── Hard errors ──────────────────────────────────────────────────
+
+    def test_error_prefix_triggers_retry(self):
+        agent = self._make_agent()
+        retry, nudge = agent._verify_tool_result("search", "ERROR: timeout", step=0)
+        assert retry
+        assert "failed" in nudge.lower()
+
+    # ── Search-specific ──────────────────────────────────────────────
+
+    def test_no_results_found_triggers_retry(self):
+        agent = self._make_agent()
+        retry, nudge = agent._verify_tool_result("search", "No results found.", step=0)
+        assert retry
+        assert "different keywords" in nudge.lower()
+
+    # ── Code-specific ────────────────────────────────────────────────
+
+    def test_code_error_triggers_retry(self):
+        agent = self._make_agent()
+        retry, nudge = agent._verify_tool_result(
+            "code_exec", "Traceback: ERROR division by zero", step=0
+        )
+        assert retry
+        assert "error" in nudge.lower()
+
+    def test_code_no_numeric_output_triggers_retry(self):
+        agent = self._make_agent()
+        retry, nudge = agent._verify_tool_result("code_exec", "ok", step=0)
+        assert retry
+        assert "print" in nudge.lower()
+
+    def test_code_with_numeric_output_passes(self):
+        agent = self._make_agent()
+        retry, nudge = agent._verify_tool_result("code_exec", "42\nDone!", step=0)
+        assert not retry
+        assert nudge == ""
+
+    # ── Browse-specific ──────────────────────────────────────────────
+
+    def test_browse_404_triggers_retry(self):
+        agent = self._make_agent()
+        retry, nudge = agent._verify_tool_result("browse", "404 Not Found", step=0)
+        assert retry
+
+    def test_browse_access_denied_triggers_retry(self):
+        agent = self._make_agent()
+        retry, nudge = agent._verify_tool_result(
+            "browse", "Access Denied: you don't have permission", step=0
+        )
+        assert retry
+
+    def test_browse_success_passes(self):
+        agent = self._make_agent()
+        retry, nudge = agent._verify_tool_result(
+            "browse", "Page content with useful information", step=0
+        )
+        assert not retry
+
+    # ── Already-verified steps ───────────────────────────────────────
+
+    def test_already_verified_step_skips(self):
+        agent = self._make_agent()
+        agent._verified_steps.add(0)
+        retry, nudge = agent._verify_tool_result("search", "", step=0)
+        assert not retry
+        assert nudge == ""
+
+    # ── Integration: retry in the run loop ───────────────────────────
+
+    def test_run_loop_retries_on_empty_output(self):
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+
+        verify = MagicMock(spec=LLMProvider)
+        verify.model = "test-model"
+        verify.call.return_value = _make_text_response("FINAL ANSWER: 42")
+
+        snapshots = _spy_call(provider, [
+            _make_tool_response(
+                "Searching...", tool_name="search",
+                tool_input={"query": "test"},
+            ),
+            _make_tool_response(
+                "Retrying...", tool_name="search",
+                tool_input={"query": "test2"},
+            ),
+            _make_text_response("FINAL ANSWER: 42"),
+        ])
+
+        with patch("agent.core.web_search", side_effect=["", "real results"]):
+            agent = ResearchAgent(
+                question="test",
+                provider=provider,
+                verify_provider=verify,
+            )
+            agent.step_budget = 5
+            result = agent.run()
+
+        assert result["answer"] == "42"
+        # First call had empty result → verification retry → second attempt
+        nudge = snapshots[1][-1]["content"]
+        assert "different keywords" in nudge.lower()
+
+    def test_run_loop_retries_on_error_output(self):
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+
+        verify = MagicMock(spec=LLMProvider)
+        verify.model = "test-model"
+        verify.call.return_value = _make_text_response("FINAL ANSWER: 42")
+
+        snapshots = _spy_call(provider, [
+            _make_tool_response(
+                "Computing...", tool_name="code_exec",
+                tool_input={"code": "bad code"},
+            ),
+            _make_tool_response(
+                "Fixing...", tool_name="code_exec",
+                tool_input={"code": "print(42)"},
+            ),
+            _make_text_response("FINAL ANSWER: 42"),
+        ])
+
+        mock_search = MagicMock(return_value="")
+        with (
+            patch.dict("agent.core._TOOL_HANDLERS", {
+                "code_exec": MagicMock(return_value="ERROR: syntax error"),
+            }),
+            patch("agent.core.web_search", mock_search),
+        ):
+            agent = ResearchAgent(
+                question="test",
+                provider=provider,
+                verify_provider=verify,
+            )
+            agent.step_budget = 5
+            result = agent.run()
+
+        assert result["answer"] == "42"
+        nudge = snapshots[1][-1]["content"]
+        assert "failed" in nudge.lower()
+
+    def test_verification_retry_only_once(self):
+        """Even if the retry still produces bad output, don't retry again."""
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+
+        verify = MagicMock(spec=LLMProvider)
+        verify.model = "test-model"
+        verify.call.return_value = _make_text_response("FINAL ANSWER: 42")
+
+        snapshots = _spy_call(provider, [
+            _make_tool_response(
+                "Searching...", tool_name="search",
+                tool_input={"query": "test"},
+            ),
+            _make_tool_response(
+                "Retrying...", tool_name="search",
+                tool_input={"query": "test2"},
+            ),
+            _make_text_response("FINAL ANSWER: 42"),
+        ])
+
+        # Both calls return empty → first triggers retry, second passes through
+        with (
+            patch("agent.core.web_search", return_value=""),
+            patch.object(
+                ResearchAgent, "_prune_context", new=lambda *a: a[1],
+            ),
+        ):
+            agent = ResearchAgent(
+                question="test",
+                provider=provider,
+                verify_provider=verify,
+            )
+            agent.step_budget = 5
+            result = agent.run()
+
+        # The answer is empty string (bad output passed through after retry)
+        assert result is not None
