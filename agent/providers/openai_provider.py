@@ -43,6 +43,10 @@ class OpenAIProvider(LLMProvider):
         self._client = OpenAI(api_key=api_key)
         self.model = model
 
+    @property
+    def context_window(self) -> int:
+        return 128_000
+
     def supports_vision(self) -> bool:
         return self.model in _VISION_MODELS or "vision" in self.model
 
@@ -135,9 +139,32 @@ class OpenAIProvider(LLMProvider):
                     )
                 )
 
+        usage = None
+        if response.usage is not None:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens or 0,
+                "completion_tokens": response.usage.completion_tokens or 0,
+                "total_tokens": response.usage.total_tokens or 0,
+            }
+
         return ProviderResponse(
             text=text,
             tool_calls=tool_calls,
             stop_reason=finish,
             raw=msg,
+            usage=usage,
         )
+
+    def estimate_cost(self, usage: dict) -> dict:
+        pricing = {
+            "gpt-4o": (2.50, 10.00),
+            "gpt-4o-mini": (0.15, 0.60),
+            "gpt-4-turbo": (10.00, 30.00),
+            "gpt-4-vision-preview": (10.00, 30.00),
+        }
+        rate = pricing.get(self.model, (2.50, 10.00))
+        cost = (
+            usage.get("prompt_tokens", 0) * rate[0]
+            + usage.get("completion_tokens", 0) * rate[1]
+        ) / 1_000_000
+        return {"cost_usd": round(cost, 6), "cost_label": f"${cost:.4f}"}

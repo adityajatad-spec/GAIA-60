@@ -74,6 +74,7 @@ class OllamaProvider(LLMProvider):
         self._checked = False
         self._vision_checked = False
         self._vision_supported = False
+        self._ctx_window = 8192
 
     # ── LLMProvider ────────────────────────────────────────────────────
 
@@ -220,14 +221,30 @@ class OllamaProvider(LLMProvider):
             # Fallback: scan text for JSON tool calls
             tool_calls = self._parse_tool_calls_from_text(text)
 
+        usage = None
+        if response.usage is not None:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens or 0,
+                "completion_tokens": response.usage.completion_tokens or 0,
+                "total_tokens": response.usage.total_tokens or 0,
+            }
+
         return ProviderResponse(
             text=text,
             tool_calls=tool_calls,
             stop_reason=finish if not tool_calls else "tool_use",
             raw=msg,
+            usage=usage,
         )
 
     # ── Vision check ────────────────────────────────────────────────────
+
+    @property
+    def context_window(self) -> int:
+        if not self._vision_checked:
+            self._vision_supported = self._check_vision()
+            self._vision_checked = True
+        return self._ctx_window
 
     def supports_vision(self) -> bool:
         """Check whether the loaded model has a vision projector.
@@ -248,6 +265,14 @@ class OllamaProvider(LLMProvider):
             )
             resp.raise_for_status()
             info = resp.json()
+            model_info = info.get("model_info", {})
+            # Extract context window from model metadata if available
+            ctx = model_info.get(
+                "llama.context_length",
+                model_info.get("bert.context_length", 8192),
+            )
+            if isinstance(ctx, (int, float)):
+                self._ctx_window = int(ctx)
             return "projector_info" in info
         except requests.RequestException:
             return False

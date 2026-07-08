@@ -19,6 +19,10 @@ class AnthropicProvider(LLMProvider):
         self._client = Anthropic(api_key=api_key)
         self.model = model
 
+    @property
+    def context_window(self) -> int:
+        return 200_000
+
     def supports_vision(self) -> bool:
         return True
 
@@ -134,9 +138,34 @@ class AnthropicProvider(LLMProvider):
             for b in tool_blocks
         ]
 
+        usage = None
+        if hasattr(response, "usage") and response.usage is not None:
+            usage = {
+                "prompt_tokens": getattr(response.usage, "input_tokens", 0),
+                "completion_tokens": getattr(response.usage, "output_tokens", 0),
+                "total_tokens": (
+                    getattr(response.usage, "input_tokens", 0)
+                    + getattr(response.usage, "output_tokens", 0)
+                ),
+            }
+
         return ProviderResponse(
             text=text,
             tool_calls=tool_calls,
             stop_reason=response.stop_reason,
             raw=response,
+            usage=usage,
         )
+
+    def estimate_cost(self, usage: dict) -> dict:
+        pricing = {
+            "claude-sonnet-4-20250514": (3.0, 15.0),
+            "claude-haiku-3-5-20241022": (0.80, 4.0),
+            "claude-opus-4-20250514": (15.0, 75.0),
+        }
+        rate = pricing.get(self.model, (3.0, 15.0))
+        cost = (
+            usage.get("prompt_tokens", 0) * rate[0]
+            + usage.get("completion_tokens", 0) * rate[1]
+        ) / 1_000_000
+        return {"cost_usd": round(cost, 6), "cost_label": f"${cost:.4f}"}

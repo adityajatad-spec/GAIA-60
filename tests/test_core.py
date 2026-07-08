@@ -190,7 +190,7 @@ class TestResearchAgent:
             _make_text_response("FINAL ANSWER: Sunny"),
         ]
 
-        mock_browse = MagicMock()
+        mock_browse = MagicMock(return_value="Browsed content")
         with (
             patch("agent.core.web_search") as mock_search,
             patch.dict("agent.core._TOOL_HANDLERS", {"browse": mock_browse}),
@@ -217,10 +217,144 @@ class TestResearchAgent:
             if e.get("tool") == "browse"
         ]
         assert len(browse_entries) == 1
-        assert "ERROR" in browse_entries[0]["output"]
-        assert "not found in any previous" in browse_entries[0]["output"]
-        # web_browse should NOT have been called at all
-        mock_browse.assert_not_called()
+        # Guard warns instead of hard-blocking
+        assert "not directly returned" in browse_entries[0]["output"]
+        assert "browsing anyway" in browse_entries[0]["output"]
+        # web_browse IS called (no longer hard-blocked)
+        mock_browse.assert_called_once_with(url="https://fake-invented-url.com/weather")
+
+    def test_browse_fuzzy_matches_www_variation(self):
+        """A browse to 'www.' prefixed URL should be allowed when search
+        returned the non-www version."""
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+        provider.call.side_effect = [
+            _make_tool_response(
+                "Let me search.", tool_name="search",
+                tool_input={"query": "weather Paris"},
+            ),
+            _make_tool_response(
+                "Let me browse.", tool_name="browse",
+                tool_input={"url": "https://www.real-site.com/paris"},
+            ),
+            _make_text_response("FINAL ANSWER: Sunny"),
+        ]
+
+        mock_browse = MagicMock(return_value="Browsed content")
+        with (
+            patch("agent.core.web_search") as mock_search,
+            patch.dict("agent.core._TOOL_HANDLERS", {"browse": mock_browse}),
+        ):
+            mock_search.return_value = [
+                {
+                    "title": "Paris Weather",
+                    "url": "https://real-site.com/paris",
+                    "snippet": "Sunny 23°C",
+                }
+            ]
+
+            agent = ResearchAgent(
+                question="What's the weather?",
+                provider=provider,
+            )
+            agent.step_budget = 5
+            result = agent.run()
+
+        assert result["answer"] == "Sunny"
+        browse_entries = [
+            e for e in result["trajectory"]
+            if e.get("tool") == "browse"
+        ]
+        assert len(browse_entries) == 1
+        # No guard warning — fuzzy match handled www variation
+        assert "not directly returned" not in browse_entries[0]["output"]
+
+    def test_browse_fuzzy_matches_subpath(self):
+        """A browse to a sub-page of a known URL should be allowed."""
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+        provider.call.side_effect = [
+            _make_tool_response(
+                "Let me search.", tool_name="search",
+                tool_input={"query": "Paris climate"},
+            ),
+            _make_tool_response(
+                "Let me browse.", tool_name="browse",
+                tool_input={"url": "https://real-site.com/paris#climate"},
+            ),
+            _make_text_response("FINAL ANSWER: Sunny"),
+        ]
+
+        mock_browse = MagicMock(return_value="Browsed content")
+        with (
+            patch("agent.core.web_search") as mock_search,
+            patch.dict("agent.core._TOOL_HANDLERS", {"browse": mock_browse}),
+        ):
+            mock_search.return_value = [
+                {
+                    "title": "Paris Weather",
+                    "url": "https://real-site.com/paris",
+                    "snippet": "Sunny 23°C",
+                }
+            ]
+
+            agent = ResearchAgent(
+                question="What's the weather?",
+                provider=provider,
+            )
+            agent.step_budget = 5
+            result = agent.run()
+
+        assert result["answer"] == "Sunny"
+        browse_entries = [
+            e for e in result["trajectory"]
+            if e.get("tool") == "browse"
+        ]
+        assert len(browse_entries) == 1
+        assert "not directly returned" not in browse_entries[0]["output"]
+
+    def test_browse_fuzzy_matches_http_variation(self):
+        """http vs https variation should be allowed."""
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+        provider.call.side_effect = [
+            _make_tool_response(
+                "Let me search.", tool_name="search",
+                tool_input={"query": "test page"},
+            ),
+            _make_tool_response(
+                "Let me browse.", tool_name="browse",
+                tool_input={"url": "http://example.org/page"},
+            ),
+            _make_text_response("FINAL ANSWER: done"),
+        ]
+
+        mock_browse = MagicMock(return_value="Browsed content")
+        with (
+            patch("agent.core.web_search") as mock_search,
+            patch.dict("agent.core._TOOL_HANDLERS", {"browse": mock_browse}),
+        ):
+            mock_search.return_value = [
+                {
+                    "title": "Test Page",
+                    "url": "https://example.org/page",
+                    "snippet": "Content",
+                }
+            ]
+
+            agent = ResearchAgent(
+                question="test", provider=provider,
+            )
+            agent.step_budget = 5
+            result = agent.run()
+
+        assert result["answer"] == "done"
+        browse_entries = [
+            e for e in result["trajectory"]
+            if e.get("tool") == "browse"
+        ]
+        assert len(browse_entries) == 1
+        assert "not directly returned" not in browse_entries[0]["output"]
 
     def test_browse_allows_url_from_search(self):
         provider = MagicMock(spec=LLMProvider)
@@ -577,7 +711,10 @@ class TestBudgetAwareness:
 
         snapshots = _spy_call(provider, responses)
 
-        with patch("agent.core.web_search", MagicMock(return_value="ok")):
+        with (
+            patch("agent.core.web_search", MagicMock(return_value="ok")),
+            patch.object(ResearchAgent, "_prune_context", new=lambda *a: a[1]),
+        ):
             agent = ResearchAgent(
                 question="test",
                 provider=provider,
@@ -599,6 +736,140 @@ class TestBudgetAwareness:
 
         assert len(warning_steps) > 0
         assert warning_steps[0] >= 10
+
+
+# ── Context Pruning ────────────────────────────────────────────────────────
+
+
+class TestContextPruning:
+    def test_prune_not_before_after_threshold(self):
+        """_prune_context should not prune when step < _prune_after."""
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+        agent = ResearchAgent("test", provider=provider)
+        agent._ctx_manager._prune_after = 3
+        msgs = [{"role": "user", "content": "test"}]
+        result = agent._prune_context(msgs, provider, step=0)
+        assert result is msgs  # same object, no prune
+
+    def test_prune_at_correct_interval(self):
+        """_prune_context should only prune when (step - _prune_after) %
+        _prune_interval == 0."""
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+        agent = ResearchAgent("test", provider=provider)
+        agent._ctx_manager._prune_after = 0
+        agent._ctx_manager._prune_interval = 5
+        agent._ctx_manager._keep_recent = 0
+        agent._ctx_manager._token_threshold = 0.0  # always trigger via token budget
+
+        msgs = [{"role": "user", "content": "Q"}]
+        for i in range(4):
+            msgs.append({"role": "assistant", "content": f"step {i}"})
+
+        # step=1: should_prune fires (token threshold) but prune enforces
+        # min interval (2) from start → no prune
+        r = agent._prune_context(msgs, provider, step=1)
+        assert r is msgs
+
+        # step=5 → should prune (min interval passed)
+        provider.call.return_value = _make_text_response("Pruned summary")
+        msgs_full = [{"role": "user", "content": "Q"}]
+        for i in range(6):
+            msgs_full.append({"role": "assistant", "content": f"step {i}"})
+            msgs_full.append({"role": "tool", "content": f"result {i}"})
+
+        r = agent._prune_context(msgs_full, provider, step=5)
+        assert r is not msgs_full
+        assert r[0]["role"] == "user"
+        assert "Pruned summary" in r[1].get("content", "") or "Pruned summary" in r[2].get("content", "")
+
+    def test_pruning_happens_during_run_loop(self):
+        """The run loop should call _prune_context at the expected intervals
+        and the pruned messages should still lead to a correct answer."""
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+        provider.context_window = 1000000
+        provider.estimate_cost.return_value = {"cost_usd": 0.0, "cost_label": "local"}
+
+        call_count = [0]
+        summary_given = [False]
+
+        def side_effect(*args, **kwargs):
+            msgs = kwargs.get("messages", [])
+            call_count[0] += 1
+            if any("Research history to compress" in str(m.get("content", "")) for m in msgs):
+                summary_given[0] = True
+                return _make_text_response(
+                    "Compressed log of research steps"
+                )
+            if call_count[0] <= 6:
+                return _make_tool_response(
+                    "Searching...", tool_name="search",
+                )
+            return _make_text_response("FINAL ANSWER: Paris")
+
+        provider.call.side_effect = side_effect
+
+        verify = MagicMock(spec=LLMProvider)
+        verify.model = "test-model"
+        verify.call.return_value = _make_text_response("FINAL ANSWER: Paris")
+        verify.estimate_cost.return_value = {"cost_usd": 0.0, "cost_label": "local"}
+
+        with patch("agent.core.web_search", return_value="search results"):
+            agent = ResearchAgent(
+                question="Capital of France?",
+                provider=provider,
+                verify_provider=verify,
+            )
+            agent._ctx_manager._prune_after = 0
+            agent._ctx_manager._prune_interval = 2
+            agent._ctx_manager._keep_recent = 0
+            agent._ctx_manager._token_threshold = 0.0
+            agent.step_budget = 10
+            result = agent.run()
+
+        assert result["answer"] == "Paris"
+        assert summary_given[0] is True
+
+    def test_pruning_failure_does_not_crash(self):
+        """If the smart compression call fails (returns ERROR), fall back
+        to window-based pruning and continue."""
+        provider = MagicMock(spec=LLMProvider)
+        provider.model = "test-model"
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            msgs = kwargs.get("messages", [])
+            if any("Research history to compress" in str(m.get("content", "")) for m in msgs):
+                return _make_text_response("ERROR: summarization failed")
+            if call_count[0] <= 2:
+                return _make_tool_response(
+                    "Searching...", tool_name="search",
+                )
+            return _make_text_response("FINAL ANSWER: Paris")
+
+        provider.call.side_effect = side_effect
+
+        verify = MagicMock(spec=LLMProvider)
+        verify.model = "test-model"
+        verify.call.return_value = _make_text_response("FINAL ANSWER: Paris")
+
+        with patch("agent.core.web_search", return_value="search results"):
+            agent = ResearchAgent(
+                question="Capital of France?",
+                provider=provider,
+                verify_provider=verify,
+            )
+            agent._ctx_manager._prune_after = 0
+            agent._ctx_manager._prune_interval = 2
+            agent._ctx_manager._keep_recent = 0
+            agent._ctx_manager._token_threshold = 0.0
+            agent.step_budget = 10
+            result = agent.run()
+
+        assert result["answer"] == "Paris"
 
 
 # ── Self-consistency voting ────────────────────────────────────────────────

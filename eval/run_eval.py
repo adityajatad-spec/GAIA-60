@@ -90,6 +90,74 @@ def _normalize_number(x: str) -> str:
     return f"{float(x):.10f}"
 
 
+# ── Compound-match helpers ────────────────────────────────────────────
+
+
+_BOOL_WORDS = {
+    "yes": "yes", "no": "no",
+    "true": "true", "false": "false",
+    "even": "even", "odd": "odd",
+}
+
+
+def _extract_numbers(text: str) -> list[float]:
+    """Extract all integers and floats in reading order."""
+    return [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", text)]
+
+
+def _find_bool_terms(text: str) -> set[str]:
+    """Return the set of boolean-like terms found in *text*."""
+    found: set[str] = set()
+    for word in re.findall(r"[a-zA-Z]+", text.lower()):
+        if word in _BOOL_WORDS:
+            found.add(_BOOL_WORDS[word])
+    return found
+
+
+def _is_compound(expected: str) -> bool:
+    """Heuristic: ground truth is compound when it has ≥2 numbers,
+    or exactly 1 number plus a boolean-like term."""
+    nums = _extract_numbers(expected)
+    bools = _find_bool_terms(expected)
+    return bool(len(nums) >= 2 or (len(nums) == 1 and bools))
+
+
+def _nums_equal(a: float, b: float) -> bool:
+    """Check numeric equality with relative tolerance (matching _quasi_exact_match single-number logic)."""
+    if abs(a) < 1e-8:
+        return abs(a - b) < 1e-8
+    return abs(a - b) / max(abs(a), abs(b)) < 1e-4
+
+
+def _is_number_subsequence(pred_nums: list[float], exp_nums: list[float]) -> bool:
+    """Check if *exp_nums* appears as an ordered subsequence of *pred_nums* with tolerance."""
+    it = iter(pred_nums)
+    for en in exp_nums:
+        for pn in it:
+            if _nums_equal(pn, en):
+                break
+        else:
+            return False
+    return True
+
+
+def _compound_match(predicted: str, expected: str) -> bool:
+    """Compound match: all numbers (in order) plus all boolean terms match."""
+    pred_nums = _extract_numbers(predicted)
+    exp_nums = _extract_numbers(expected)
+
+    if not exp_nums or not _is_number_subsequence(pred_nums, exp_nums):
+        return False
+
+    pred_bools = _find_bool_terms(predicted)
+    exp_bools = _find_bool_terms(expected)
+
+    if exp_bools and not exp_bools.issubset(pred_bools):
+        return False
+
+    return True
+
+
 def _quasi_exact_match(predicted: str, expected: str) -> bool:
     pred = predicted.strip()
     exp = expected.strip()
@@ -101,7 +169,7 @@ def _quasi_exact_match(predicted: str, expected: str) -> bool:
     if len(alternatives) > 1:
         return any(_quasi_exact_match(predicted, a) for a in alternatives)
 
-    # Boolean variants
+    # Boolean variants (whole-string)
     bool_map = {
         "yes": "true", "no": "false",
         "y": "true", "n": "false",
@@ -112,7 +180,7 @@ def _quasi_exact_match(predicted: str, expected: str) -> bool:
     if p_bool is not None and e_bool is not None:
         return p_bool == e_bool
 
-    # Numeric match with tolerance
+    # Numeric match with tolerance (single number)
     if _is_number(pred) and _is_number(exp):
         pn = float(pred)
         en = float(exp)
@@ -121,6 +189,11 @@ def _quasi_exact_match(predicted: str, expected: str) -> bool:
         if abs(pn - en) / max(abs(pn), abs(en)) < 1e-4:
             return True
         return _normalize_number(pred) == _normalize_number(exp)
+
+    # Compound match (multi-value answers)
+    if _is_compound(exp):
+        if _compound_match(pred, exp):
+            return True
 
     # Normalized string match
     p_norm = _normalize(pred)
@@ -154,6 +227,7 @@ def run_question(
     record: dict[str, Any],
     provider: LLMProvider,
     step_budget: int,
+    votes: int = 1,
 ) -> dict[str, Any]:
     task_id = record.get("task_id", "unknown")
     question = record.get("Question", "")
@@ -170,7 +244,10 @@ def run_question(
 
     t0 = time.time()
     try:
-        result = agent.run()
+        if votes > 1:
+            result = agent.run_with_voting(n=votes)
+        else:
+            result = agent.run()
     except Exception as exc:
         elapsed = time.time() - t0
         return {
@@ -184,6 +261,7 @@ def run_question(
             "provider": provider.__class__.__name__.replace("Provider", "").lower(),
             "model": getattr(provider, "model", "?"),
             "elapsed_seconds": round(elapsed, 2),
+            "usage": {},
             "error": str(exc),
         }
 
@@ -205,6 +283,9 @@ def run_question(
         "steps_used": result.get("steps_used"),
         "format_noncompliant": result.get("format_noncompliant", False),
         "empty_response_failure": result.get("empty_response_failure", False),
+        "usage": result.get("usage", {}),
+        "votes": result.get("votes"),
+        "n_runs": result.get("n_runs"),
     }
 
 
@@ -292,9 +373,21 @@ def main() -> None:
         help="Max tool-use steps per question (default: 15).",
     )
     parser.add_argument(
+        "--votes",
+        type=int,
+        default=1,
+        help="Run N agents per question and take majority answer (default: 1).",
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help="Output path override (default: eval/results/<timestamp>.jsonl).",
+    )
+    parser.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=None,
+        help="Stop after cumulative spend exceeds this amount (cloud providers only).",
     )
 
     args = parser.parse_args()
@@ -347,20 +440,32 @@ def main() -> None:
 
     # Run
     results: list[dict[str, Any]] = []
+    cumulative_cost: float = 0.0
     if args.parallel == 1:
         for i, record in enumerate(all_questions, 1):
+            if args.max_cost_usd is not None and cumulative_cost >= args.max_cost_usd:
+                print(
+                    f"  [cost cap] ${cumulative_cost:.4f} >= ${args.max_cost_usd}"
+                    " — stopping"
+                )
+                break
+
             task_id = record.get("task_id", "unknown")
             level = record.get("Level", "?")
             print(
                 f"[{i}/{len(all_questions)}] {task_id}"
                 f"  (Level {level})  {record.get('Question', '')[:80]}..."
             )
-            result = run_question(record, provider, args.steps)
+            result = run_question(record, provider, args.steps, votes=args.votes)
             mark = "✓" if result.get("correct") else "✗"
             predicted = result.get("predicted", "")
             gt = result.get("ground_truth", "")
             elapsed = result.get("elapsed_seconds", 0)
-            print(f"  {mark}  pred={predicted[:80]}  gt={gt[:80]}  ({elapsed}s)")
+            usage = result.get("usage", {})
+            cost = usage.get("cost_usd", 0.0)
+            cumulative_cost += cost
+            cost_info = f", cost=${cost:.4f} (cumul=${cumulative_cost:.4f})" if cost > 0 else ""
+            print(f"  {mark}  pred={predicted[:80]}  gt={gt[:80]}  ({elapsed}s{cost_info})")
             results.append(result)
 
             # Flush every question
@@ -370,13 +475,12 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=args.parallel) as pool:
             fut_map = {
                 pool.submit(
-                    run_question, record, provider, args.steps
-                ): (i, record)
+                    run_question, record, provider, args.steps, args.votes
+                ): (i, record, record.get("task_id", "unknown"))
                 for i, record in enumerate(all_questions, 1)
             }
             for future in as_completed(fut_map):
-                i, record = fut_map[future]
-                task_id = record.get("task_id", "unknown")
+                i, record, task_id = fut_map[future]
                 try:
                     result = future.result()
                 except Exception as exc:
@@ -393,15 +497,24 @@ def main() -> None:
                         "error": str(exc),
                     }
                 mark = "✓" if result.get("correct") else "✗"
+                cost = result.get("usage", {}).get("cost_usd", 0.0)
+                cumulative_cost += cost
+                cost_info = f"  cost=${cost:.4f} (cumul=${cumulative_cost:.4f})" if cost > 0 else ""
                 print(
                     f"[{i}/{len(all_questions)}] {task_id}  {mark}"
-                    f"  ({result.get('elapsed_seconds', '?')}s)"
+                    f"  ({result.get('elapsed_seconds', '?')}s{cost_info})"
                 )
                 results.append(result)
                 with open(out_path, "a") as f:
                     f.write(
                         json.dumps(result, ensure_ascii=False, default=str) + "\n"
                     )
+
+    if args.max_cost_usd is not None and cumulative_cost > 0:
+        print(
+            f"\nTotal spend: ${cumulative_cost:.4f}"
+            f"  (cap: ${args.max_cost_usd})"
+        )
 
     # Summary
     print_summary(results)

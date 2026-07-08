@@ -18,6 +18,7 @@ class ProviderResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str = "end_turn"
     raw: Any = None
+    usage: dict | None = None
 
 
 class LLMProvider(ABC):
@@ -26,6 +27,19 @@ class LLMProvider(ABC):
     def supports_vision(self) -> bool:
         """Return True if the model can process image content blocks."""
         return False
+
+    @property
+    def context_window(self) -> int:
+        """Maximum context length in tokens for this provider/model."""
+        return 8192
+
+    def estimate_cost(self, usage: dict) -> dict:
+        """Return cost estimate for a given usage dict.
+
+        Returns ``{"cost_usd": float, "cost_label": str}``.
+        Default: local (no cost).
+        """
+        return {"cost_usd": 0.0, "cost_label": "local (no cost)"}
 
     @abstractmethod
     def call(

@@ -138,6 +138,13 @@ def main() -> None:
     print("─" * 50)
     print(f"\nFINAL ANSWER: {result['answer']}")
     print(f"(used {result['steps_used']} of {agent.step_budget} steps)")
+
+    usage = result.get("usage", {})
+    if usage:
+        tok_str = f"{usage.get('total_tokens', 0)} tokens"
+        cost_str = usage.get("cost_label", "local (no cost)")
+        print(f"(usage: {tok_str}, {cost_str})")
+
     if args.votes:
         print(f"(votes: {result.get('votes', 'N/A')})")
 

@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .config import load_config
+from .context_manager import ContextManager, FACT_EXTRACTION_INSTRUCTION
 from .providers.base import LLMProvider, ProviderResponse, ToolCall
 from tools.code_exec import run_python
 from tools.files import read_file, read_image, is_image
@@ -12,6 +14,38 @@ from tools.web import web_browse, web_search
 
 _URL_PATTERN = re.compile(r"URL: (https?://\S+)")
 _FINAL_ANSWER_RE = re.compile(r"(?i)FINAL[\s_]+ANSWER\s*:?\s*")
+
+
+def _urls_equivalent(browse_url: str, known_url: str) -> bool:
+    """Fuzzy-match a browse URL against a known search-result URL.
+
+    Handles trailing slashes, www vs non-www, http vs https,
+    fragments, query params, and sub-path browsing.
+    """
+    b = _normalize_url(browse_url)
+    k = _normalize_url(known_url)
+    if b["full"] == k["full"]:
+        return True
+    # www / non-www
+    if b["host_www"] == k["host_www"] and b["path"] == k["path"]:
+        return True
+    # Same host: one path is a prefix of the other (sub-page browsing)
+    if b["host"] == k["host"]:
+        if k["path"].startswith(b["path"]) or b["path"].startswith(k["path"]):
+            return True
+    return False
+
+
+def _normalize_url(url: str) -> dict:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    return {
+        "full": url.rstrip("/").lower(),
+        "host": host,
+        "host_www": host.replace("www.", ""),
+        "path": parsed.path.rstrip("/") or "/",
+        "scheme": parsed.scheme,
+    }
 
 _MEDIA_TYPE_MAP: dict[str, str] = {
     ".png": "image/png",
@@ -48,14 +82,19 @@ SYSTEM_PROMPT = """\
 You are a research assistant that answers complex questions by breaking them down into sub-steps, using tools to gather information, and verifying facts before answering.
 
 Guidelines:
-- Break down the question into sub-steps before acting
-- Start with web_search to find relevant information. If the search results already directly and clearly answer the question, use that information to produce a FINAL ANSWER immediately — do not call browse as a reflexive next step.
-- Only use web_browse when search snippets are incomplete, ambiguous, or don't fully answer the question.
+- Before acting, explicitly list each sub-step you need to complete. For multi-part questions (e.g., "do X, then find Y, then compute Z"), list every required value before you start.
+- Use web_search to find each factual piece. If search snippets are clearly sufficient, do not browse — proceed directly. Only use web_browse when snippets are incomplete or ambiguous.
 - When you do browse a URL, check whether the page content is clearly relevant and current to the question. If the page looks like documentation, an API reference, template, or sample/example data rather than live, current information, disregard it and either try a more specific search or answer from what you already have.
-- Verify factual claims via tools rather than relying on memory
-- Keep the final answer as short and precise as possible (a number, a name, a short phrase) unless the question explicitly asks for something longer
+- Verify factual claims via tools rather than relying on memory.
+- Use code_exec for ALL mathematical computations. Never compute values mentally or through estimation — always use Python.
+- Track your progress: after each step, note what you've found and what remains.
+- Before producing FINAL ANSWER, verify you have answered EVERY part of the question. If the question asks for multiple values (e.g., "find X, compute Y, check Z"), report ALL of them — do not skip any.
+- For chain questions where a value depends on a previous result, re-state all intermediate values in the final answer. Every number requested in the question must appear in the answer.
 
 Important: when using the code_exec tool, always remember to use print() to display any value you want to see. For example, write ``print(847 * 293 / 17)`` instead of just ``847 * 293 / 17``. If you write a bare expression on the last line the tool will automatically capture and print it (like a Jupyter notebook), but explicit print() calls are more reliable.
+
+Extract key factual findings as structured facts using this format:
+[FACT] {"fact": "...", "source": "...", "confidence": 0.0} [/FACT]
 
 Every response you send must end either with tool calls or with a final answer in the following exact format. There are no exceptions. If you are uncertain, state your best guess in the required format rather than hedging in prose.
 
@@ -212,6 +251,12 @@ class ResearchAgent:
         self._retried_steps: set[int] = set()
         self._budget_warning_given = False
         self._verify_provider = verify_provider
+        self._usage_by_provider: list[tuple[LLMProvider, dict]] = []
+        self._ctx_manager = ContextManager(
+            question=question,
+            provider=provider,
+            step_budget=self.step_budget,
+        )
 
     def _build_initial_messages(
         self, provider: LLMProvider
@@ -305,6 +350,8 @@ class ResearchAgent:
                 tools=TOOL_DEFINITIONS,
                 system_prompt=SYSTEM_PROMPT,
             )
+            if response.usage:
+                self._usage_by_provider.append((provider, response.usage))
 
             # Record the model message in the trajectory
             msg_entry = {
@@ -330,6 +377,8 @@ class ResearchAgent:
                     for tc in response.tool_calls
                 ]
             messages.append(assistant_msg)
+
+            self._ctx_manager.record_facts_from_response(response.text, step)
 
             if step_callback:
                 step_callback({"type": "assistant", "data": msg_entry})
@@ -358,6 +407,7 @@ class ResearchAgent:
                     "steps_used": step + 1,
                     "format_noncompliant": False,
                     "verification_performed": True,
+                    "usage": self._build_usage(),
                 }
 
             # ── No tool calls → format compliance check ───────────────
@@ -379,6 +429,7 @@ class ResearchAgent:
                             'FINAL ANSWER: <answer>'
                         )
                     messages.append({"role": "user", "content": nudge})
+                    messages = self._prune_context(messages, provider, step)
                     continue
                 # Second attempt — accept whatever we got
                 is_empty = not full_text.strip()
@@ -391,6 +442,7 @@ class ResearchAgent:
                     "steps_used": step + 1,
                     "format_noncompliant": True,
                     "empty_response_failure": is_empty,
+                    "usage": self._build_usage(),
                 }
 
             # ── Execute tool calls ────────────────────────────────────
@@ -429,7 +481,10 @@ class ResearchAgent:
                         "type": "tool_retry",
                         "data": {"step": step, "errors": tool_errors},
                     })
+                messages = self._prune_context(messages, provider, step)
                 continue
+
+            messages = self._prune_context(messages, provider, step)
 
         # Budget exhausted
         return {
@@ -437,30 +492,22 @@ class ResearchAgent:
             "trajectory": self.trajectory,
             "steps_used": self.step_budget,
             "format_noncompliant": False,
+            "usage": self._build_usage(),
         }
 
     def _execute_tool(self, name: str, inp: dict, step: int) -> str:
-        # ── Browse guard: reject URLs not from prior search results ──
-        if name == "browse":
+        # ── Browse guard: fuzzy-match URL against prior search results ──
+        guard_warning = ""
+        if name == "browse" and self._known_urls:
             url = inp.get("url", "")
-            normalized = url.rstrip("/")
-            known = {u.rstrip("/") for u in self._known_urls}
-            if normalized not in known:
-                output = (
-                    "ERROR: This URL was not found in any previous "
-                    "search results. Only browse URLs returned "
-                    "directly by the search tool — do not construct "
-                    "or guess URLs."
+            allowed = any(
+                _urls_equivalent(url, k) for k in self._known_urls
+            )
+            if not allowed:
+                guard_warning = (
+                    "Note: this URL was not directly returned by any "
+                    "search result — browsing anyway.\n\n"
                 )
-                self.trajectory.append(
-                    {
-                        "step": step,
-                        "tool": name,
-                        "input": inp,
-                        "output": output,
-                    }
-                )
-                return output
 
         handler = _TOOL_HANDLERS.get(name)
         if handler is None:
@@ -470,6 +517,10 @@ class ResearchAgent:
                 output = handler(**inp)
             except Exception as exc:
                 output = f"ERROR: {exc}"
+
+        # Prepend guard warning if applicable
+        if guard_warning:
+            output = guard_warning + output
 
         # ── After search, collect URLs for the browse guard ──────────
         if name == "search":
@@ -501,16 +552,38 @@ class ResearchAgent:
 
     def _verify(self, verify_provider: LLMProvider, answer: str) -> str:
         traj_summary = self._summarize_trajectory()
+
+        # Detect whether the question is multi-part by looking for
+        # numbered sub-steps or multiple request patterns
+        multi_part = bool(
+            re.search(
+                r"(?:\(\d+\)\s|Do the following in order|"
+                r"in order.*then|find.*find|find.*compute|"
+                r"compute.*determine|computing.*then)",
+                self.question,
+                re.IGNORECASE,
+            )
+        )
+
+        coverage_check = (
+            "List all parts of the question and whether each is answered.\n"
+            "Then produce the final verified answer.\n"
+            "FINAL ANSWER: "
+            if multi_part
+            else (
+                "If the answer is correct and complete, repeat it exactly. "
+                "If incorrect or incomplete, provide a corrected version.\n"
+                "FINAL ANSWER: "
+            )
+        )
+
         verify_prompt = (
             f"Original question: {self.question}\n\n"
             f"Research trajectory:\n{traj_summary}\n\n"
             f"Proposed answer: {answer}\n\n"
             "Please verify this answer. Does it completely address all parts of the question? "
-            "Is it consistent with the evidence gathered? "
-            "If the answer is correct and complete, repeat it exactly using the format "
-            "FINAL ANSWER: <answer>. "
-            "If it is incorrect or incomplete, provide a corrected version.\n"
-            "FINAL ANSWER: "
+            "Is it consistent with the evidence gathered?\n"
+            f"{coverage_check}"
         )
         try:
             response = verify_provider.call(
@@ -518,6 +591,8 @@ class ResearchAgent:
                 tools=None,
                 system_prompt=SYSTEM_PROMPT,
             )
+            if response.usage:
+                self._usage_by_provider.append((verify_provider, response.usage))
             found, normalized = _normalize_final_answer_prefix(response.text)
             if found:
                 return normalized.split("FINAL ANSWER:", 1)[1].strip()
@@ -529,6 +604,27 @@ class ResearchAgent:
         except Exception:
             pass
         return answer
+
+    def _build_usage(self) -> dict:
+        total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        total_cost = 0.0
+        for provider, usage in self._usage_by_provider:
+            for k in total:
+                total[k] += usage.get(k, 0)
+            cost_info = provider.estimate_cost(usage)
+            total_cost += cost_info["cost_usd"]
+        label = f"${total_cost:.4f}" if total_cost > 0 else "local (no cost)"
+        return {
+            **total,
+            "cost_usd": round(total_cost, 6),
+            "cost_label": label,
+        }
+
+    def _prune_context(
+        self, messages: list[dict[str, Any]], provider: LLMProvider, step: int
+    ) -> list[dict[str, Any]]:
+        """Delegate to ContextManager. Kept for backward-compatible test mocking."""
+        return self._ctx_manager.prune(messages, step)
 
     def run_with_voting(self, n: int = 3, step_callback=None) -> dict:
         from collections import Counter
