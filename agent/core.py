@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from .config import load_config
 from .context_manager import ContextManager, FACT_EXTRACTION_INSTRUCTION
+from .planner import Plan, needs_planning, build_plan, PLANNER_SYSTEM_PROMPT
 from .providers.base import LLMProvider, ProviderResponse, ToolCall
 from tools.code_exec import run_python
 from tools.files import read_file, read_image, is_image
@@ -257,6 +258,7 @@ class ResearchAgent:
             provider=provider,
             step_budget=self.step_budget,
         )
+        self._plan: Plan | None = None
 
     def _build_initial_messages(
         self, provider: LLMProvider
@@ -330,6 +332,27 @@ class ResearchAgent:
 
         messages = self._build_initial_messages(provider)
 
+        # ── Planning phase (multi-step questions only) ─────────────
+        if needs_planning(self.question):
+            try:
+                plan_resp = provider.call(
+                    messages=[{"role": "user", "content": self.question}],
+                    tools=None,
+                    system_prompt=PLANNER_SYSTEM_PROMPT,
+                )
+                if plan_resp.usage:
+                    self._usage_by_provider.append((provider, plan_resp.usage))
+                if plan_resp.text:
+                    self._plan = build_plan(plan_resp.text)
+                    if self._plan.steps:
+                        messages.append({
+                            "role": "user",
+                            "content": self._plan.to_prompt_string(),
+                        })
+            except Exception as exc:
+                # Planning failed — proceed without plan
+                pass
+
         for step in range(self.step_budget):
             if (
                 not self._budget_warning_given
@@ -398,6 +421,26 @@ class ResearchAgent:
             # ── Check for final answer ────────────────────────────────
             found, normalized = _normalize_final_answer_prefix(full_text)
             if found:
+                # Plan completeness check: if steps remain, nudge once
+                if (
+                    self._plan is not None
+                    and not self._plan.all_complete()
+                ):
+                    incomplete = self._plan.incomplete_steps()
+                    step_desc = "\n".join(
+                        f"  - Step {s.step}: {s.description}"
+                        for s in incomplete
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You produced a final answer but the following "
+                            f"steps are not yet complete:\n{step_desc}\n\n"
+                            "Please complete them first."
+                        ),
+                    })
+                    continue
+
                 answer = normalized.split("FINAL ANSWER:", 1)[1].strip()
                 verify_provider = self._verify_provider or provider
                 verified = self._verify(verify_provider, answer)
@@ -456,6 +499,19 @@ class ResearchAgent:
                         "content": output,
                     }
                 )
+
+            # ── Update plan progress ──────────────────────────────────
+            if self._plan is not None:
+                all_tool_text = " ".join(
+                    str(m.get("content", ""))
+                    for m in messages
+                    if m.get("role") == "tool"
+                )
+                self._plan.mark_complete_by_output(all_tool_text)
+                messages.append({
+                    "role": "user",
+                    "content": self._plan.to_progress_string(),
+                })
 
             # ── Retry on tool failure (once per step) ────────────────
             tool_errors = [
